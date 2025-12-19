@@ -561,21 +561,20 @@ with st.sidebar:
 
     st.divider()
     st.header("Quiz settings")
+
     bank_objs = load_bank_objects()
-    max_q = max(1, len(bank_objs))
-    max_q = len(question_bank)
+    max_q = len(bank_objs)
 
-if max_q == 0:
-    st.warning("No questions available yet. Please add questions first.")
-    st.stop()
+    if max_q == 0:
+        st.warning("No questions available yet. Please add questions first.")
+        st.stop()
 
-n_req = st.slider(
-    "Number of questions",
-    min_value=1,
-    max_value=max_q,
-    value=min(10, max_q),
-)
-
+    n_req = st.slider(
+        "Number of questions",
+        min_value=1,
+        max_value=max_q,
+        value=min(10, max_q),
+    )
 
     st.checkbox("Show answer key (facit)", key="show_facit")
     st.checkbox("Practice mode (instant feedback)", key="practice_mode")
@@ -585,6 +584,7 @@ n_req = st.slider(
     if st.button("🎲 Create new random test", use_container_width=True):
         create_new_random_exam(n_req)
         do_rerun()
+
 
 tabs = st.tabs(["🧱 Build Question Bank", "📝 Take Test", "📊 Results history"])
 
