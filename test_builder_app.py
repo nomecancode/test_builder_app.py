@@ -563,7 +563,19 @@ with st.sidebar:
     st.header("Quiz settings")
     bank_objs = load_bank_objects()
     max_q = max(1, len(bank_objs))
-    n_req = st.slider("Number of questions", 1, max_q, min(10, max_q))
+    max_q = len(question_bank)
+
+if max_q == 0:
+    st.warning("No questions available yet. Please add questions first.")
+    st.stop()
+
+n_req = st.slider(
+    "Number of questions",
+    min_value=1,
+    max_value=max_q,
+    value=min(10, max_q),
+)
+
 
     st.checkbox("Show answer key (facit)", key="show_facit")
     st.checkbox("Practice mode (instant feedback)", key="practice_mode")
