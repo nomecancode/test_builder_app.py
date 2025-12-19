@@ -7,7 +7,8 @@ from datetime import datetime
 from typing import List, Optional, Set, Dict, Any, Tuple
 
 import streamlit as st
-from google.oauth2.service_account import Credentials
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
 
