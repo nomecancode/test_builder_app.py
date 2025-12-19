@@ -17,13 +17,19 @@ from googleapiclient.http import MediaInMemoryUpload
 # Google Drive helpers
 # ============================================================
 
-DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
-
+DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 
 @st.cache_resource
 def get_drive_service():
-    creds_dict = dict(st.secrets["gcp_service_account"])
-    creds = Credentials.from_service_account_info(creds_dict, scopes=[DRIVE_SCOPE])
+    creds = Credentials(
+        token=None,
+        refresh_token=st.secrets["GDRIVE_REFRESH_TOKEN"],
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=st.secrets["GDRIVE_CLIENT_ID"],
+        client_secret=st.secrets["GDRIVE_CLIENT_SECRET"],
+        scopes=[DRIVE_SCOPE],
+    )
+    creds.refresh(Request())
     return build("drive", "v3", credentials=creds)
 
 
