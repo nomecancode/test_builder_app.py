@@ -7,20 +7,42 @@ from datetime import datetime
 from typing import List, Optional, Set, Dict, Any, Tuple
 
 import streamlit as st
+
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
+from googleapiclient.errors import HttpError
 
 
 # ============================================================
-# Google Drive helpers
+# OAuth + Drive helpers (uses your Google account quota)
+# Secrets required in Streamlit Cloud:
+#   GDRIVE_FOLDER_ID
+#   GDRIVE_CLIENT_ID
+#   GDRIVE_CLIENT_SECRET
+#   GDRIVE_REFRESH_TOKEN
 # ============================================================
 
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 
+
+def _require_secrets():
+    needed = ["GDRIVE_FOLDER_ID", "GDRIVE_CLIENT_ID", "GDRIVE_CLIENT_SECRET", "GDRIVE_REFRESH_TOKEN"]
+    missing = [k for k in needed if k not in st.secrets]
+    if missing:
+        st.error(
+            "Missing Streamlit secrets: "
+            + ", ".join(missing)
+            + "\n\nGo to Streamlit Cloud → Manage app → Settings → Secrets and add them."
+        )
+        st.stop()
+
+
 @st.cache_resource
 def get_drive_service():
+    _require_secrets()
+
     creds = Credentials(
         token=None,
         refresh_token=st.secrets["GDRIVE_REFRESH_TOKEN"],
@@ -29,7 +51,9 @@ def get_drive_service():
         client_secret=st.secrets["GDRIVE_CLIENT_SECRET"],
         scopes=[DRIVE_SCOPE],
     )
+    # Ensure we have an access token now (and creds can refresh later too)
     creds.refresh(Request())
+
     return build("drive", "v3", credentials=creds)
 
 
@@ -39,12 +63,13 @@ def _folder_id() -> str:
 
 def drive_find_file_id(service, filename: str) -> Optional[str]:
     # Find exact filename inside folder
+    # NOTE: drive.file scope might not list non-app files; that's fine because we create our own files.
     q = (
         f"name = '{filename}' and "
         f"'{_folder_id()}' in parents and "
         "trashed = false"
     )
-    resp = service.files().list(q=q, fields="files(id,name)").execute()
+    resp = service.files().list(q=q, fields="files(id,name)", pageSize=10).execute()
     files = resp.get("files", [])
     return files[0]["id"] if files else None
 
@@ -76,26 +101,25 @@ def drive_write_json(service, filename: str, obj) -> None:
         service.files().create(body=metadata, media_body=media, fields="id").execute()
 
 
-def safe_user_key(username: str) -> str:
-    # keep filenames safe and consistent
-    return "".join(c for c in username.strip() if c.isalnum() or c in ("_", "-", ".")).strip()
+# ============================================================
+# Auth (simple; stored in Drive)
+# ============================================================
 
-
-def users_filename() -> str:
+def _users_filename() -> str:
     return "users.json"
 
 
-def bank_filename(username: str) -> str:
-    return f"bank_{safe_user_key(username)}.json"
+def _safe_user_key(username: str) -> str:
+    return "".join(c for c in username.strip() if c.isalnum() or c in ("_", "-", ".")).strip()
 
 
-def results_filename(username: str) -> str:
-    return f"results_{safe_user_key(username)}.json"
+def _bank_filename(username: str) -> str:
+    return f"bank_{_safe_user_key(username)}.json"
 
 
-# ============================================================
-# Simple auth (stored in Drive)
-# ============================================================
+def _results_filename(username: str) -> str:
+    return f"results_{_safe_user_key(username)}.json"
+
 
 def _hash_pw(password: str, salt: str) -> str:
     return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
@@ -103,12 +127,12 @@ def _hash_pw(password: str, salt: str) -> str:
 
 def load_users() -> Dict[str, Dict[str, str]]:
     svc = get_drive_service()
-    return drive_read_json(svc, users_filename(), {})
+    return drive_read_json(svc, _users_filename(), {})
 
 
 def save_users(users: Dict[str, Dict[str, str]]) -> None:
     svc = get_drive_service()
-    drive_write_json(svc, users_filename(), users)
+    drive_write_json(svc, _users_filename(), users)
 
 
 def create_user(username: str, password: str) -> Tuple[bool, str]:
@@ -128,12 +152,12 @@ def create_user(username: str, password: str) -> Tuple[bool, str]:
     users[username] = {"salt": salt, "hash": _hash_pw(password, salt)}
     save_users(users)
 
-    # Initialize empty bank + results
+    # initialize empty bank/results
     svc = get_drive_service()
-    if drive_find_file_id(svc, bank_filename(username)) is None:
-        drive_write_json(svc, bank_filename(username), [])
-    if drive_find_file_id(svc, results_filename(username)) is None:
-        drive_write_json(svc, results_filename(username), [])
+    if drive_find_file_id(svc, _bank_filename(username)) is None:
+        drive_write_json(svc, _bank_filename(username), [])
+    if drive_find_file_id(svc, _results_filename(username)) is None:
+        drive_write_json(svc, _results_filename(username), [])
 
     return True, "Account created."
 
@@ -168,13 +192,17 @@ class BankQuestion:
 
     max_points: int = 1
 
+    # NEW: multi partial scoring
+    points_per_correct: int = 0
+    allow_partial_scoring: bool = False
+
     def __post_init__(self):
         if self.tags is None:
             self.tags = []
 
 
 # ============================================================
-# Session defaults
+# Session defaults / helpers
 # ============================================================
 
 def ensure_defaults():
@@ -208,29 +236,29 @@ def do_rerun():
 
 
 # ============================================================
-# Bank + results I/O (Drive)
+# Bank / results I/O (Drive)
 # ============================================================
 
 def load_bank_for_user(username: str) -> None:
     svc = get_drive_service()
-    st.session_state.question_bank = drive_read_json(svc, bank_filename(username), [])
+    st.session_state.question_bank = drive_read_json(svc, _bank_filename(username), [])
 
 
 def save_bank_for_user(username: str) -> None:
     svc = get_drive_service()
-    drive_write_json(svc, bank_filename(username), st.session_state.question_bank)
+    drive_write_json(svc, _bank_filename(username), st.session_state.question_bank)
 
 
 def load_results_for_user(username: str) -> List[Dict[str, Any]]:
     svc = get_drive_service()
-    return drive_read_json(svc, results_filename(username), [])
+    return drive_read_json(svc, _results_filename(username), [])
 
 
 def append_result_for_user(username: str, attempt: Dict[str, Any]) -> None:
     svc = get_drive_service()
-    results = drive_read_json(svc, results_filename(username), [])
+    results = drive_read_json(svc, _results_filename(username), [])
     results.append(attempt)
-    drive_write_json(svc, results_filename(username), results)
+    drive_write_json(svc, _results_filename(username), results)
 
 
 def load_bank_objects() -> List[BankQuestion]:
@@ -257,33 +285,38 @@ def next_id(bank: List[BankQuestion]) -> str:
 # Scoring
 # ============================================================
 
-def score_single(correct: int, chosen: Optional[int]) -> int:
-    return 1 if chosen is not None and chosen == correct else 0
+def score_multi(q: BankQuestion, chosen: Set[int]) -> int:
+    correct = set(q.correct_multi or [])
+    chosen = set(chosen or set())
 
+    # All-or-nothing (default)
+    if not q.allow_partial_scoring or int(q.points_per_correct) <= 0:
+        return int(q.max_points) if chosen == correct else 0
 
-def score_multi_all_or_nothing(correct: Set[int], chosen: Set[int], maxp: int) -> int:
-    return maxp if chosen == correct else 0
+    # Partial scoring:
+    # If you select ANY wrong option => 0 points (prevents "select all")
+    if any(x not in correct for x in chosen):
+        return 0
 
-
-def score_ordering_strict(correct: List[str], chosen: List[str], maxp: int) -> int:
-    norm_c = [c.strip().lower() for c in correct]
-    norm_u = [c.strip().lower() for c in chosen]
-    return maxp if norm_u == norm_c else 0
+    pts = len(chosen & correct) * int(q.points_per_correct)
+    return max(0, min(int(q.max_points), pts))
 
 
 def compute_points(q: BankQuestion, ans_orig: Any) -> int:
     if q.qtype == "single":
         if q.correct_single is None:
             return 0
-        return score_single(int(q.correct_single), ans_orig)
+        return 1 if ans_orig is not None and int(ans_orig) == int(q.correct_single) else 0
 
     if q.qtype == "multi":
-        return score_multi_all_or_nothing(set(q.correct_multi or []), set(ans_orig or set()), int(q.max_points))
+        return score_multi(q, set(ans_orig or set()))
 
     if q.qtype == "ordering":
         if not ans_orig or any(a is None for a in ans_orig) or len(set(ans_orig)) != len(ans_orig):
             return 0
-        return score_ordering_strict(list(q.correct_order or []), list(ans_orig), int(q.max_points))
+        norm_c = [c.strip().lower() for c in (q.correct_order or [])]
+        norm_u = [c.strip().lower() for c in ans_orig]
+        return int(q.max_points) if norm_u == norm_c else 0
 
     return 0
 
@@ -360,7 +393,7 @@ def build_wrong_details(q: BankQuestion, ans_disp: Any, meta: Dict[str, Any]) ->
 
 
 # ============================================================
-# Quiz engine (build / retry / grade)
+# Quiz engine
 # ============================================================
 
 def build_exam_from_questions(questions: List[BankQuestion]) -> None:
@@ -404,7 +437,7 @@ def create_new_random_exam(n_req: int) -> None:
     if not bank:
         st.warning("Question bank is empty. Add questions first.")
         return
-    n = min(n_req, len(bank))
+    n = min(int(n_req), len(bank))
     selected = random.sample(bank, n)
     build_exam_from_questions(selected)
 
@@ -451,6 +484,7 @@ def grade_exam() -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, int]]]:
         m = meta.get(i, {})
         ans_disp = st.session_state.answers.get(i)
 
+        # Convert display->original for single/multi
         if q.qtype in ("single", "multi"):
             d2o = m["display_to_orig"]
             if q.qtype == "single":
@@ -489,6 +523,7 @@ def grade_exam() -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, int]]]:
 
     st.session_state.last_results = results
 
+    # Save attempt
     if st.session_state.auth_user:
         attempt = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -504,19 +539,28 @@ def grade_exam() -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, int]]]:
 
 
 # ============================================================
-# App UI
+# UI
 # ============================================================
 
 ensure_defaults()
-st.set_page_config(page_title="Test Builder + Quiz Runner (Drive)", layout="wide")
+st.set_page_config(page_title="Test Builder + Quiz Runner", layout="wide")
 
 
-# ------------------ LOGIN ------------------
+# ------------------ LOGIN SCREEN ------------------
 
 if not st.session_state.auth_user:
-    st.title("🔐 Login (Google Drive storage)")
+    st.title("🔐 Login")
+
+    # Touch Drive once so we can show clearer errors early
+    try:
+        _ = get_drive_service()
+    except HttpError as e:
+        st.error("Google Drive API error. Check OAuth secrets and folder ID.")
+        st.exception(e)
+        st.stop()
 
     cols = st.columns(2)
+
     with cols[0]:
         st.subheader("Log in")
         u = st.text_input("Username", key="login_user")
@@ -542,16 +586,18 @@ if not st.session_state.auth_user:
             else:
                 st.error(msg)
 
-    st.caption("This is a simple login for personal use. Data is stored as JSON files in your Google Drive folder.")
+    st.caption("Data is stored as JSON files inside your Google Drive folder.")
     st.stop()
 
 
-# ------------------ MAIN ------------------
+# ------------------ MAIN APP ------------------
 
 user = st.session_state.auth_user
 st.title("🧪 Test Builder + Quiz Runner")
 st.caption(f"Logged in as **{user}**")
 
+
+# Sidebar controls
 with st.sidebar:
     st.header("Account")
     if st.button("Logout", use_container_width=True):
@@ -566,85 +612,172 @@ with st.sidebar:
     max_q = len(bank_objs)
 
     if max_q == 0:
-        st.warning("No questions available yet. Please add questions first.")
-        st.stop()
-
-    n_req = st.slider(
-        "Number of questions",
-        min_value=1,
-        max_value=max_q,
-        value=min(10, max_q),
-    )
+        st.warning("No questions available yet. Add questions first in the Builder tab.")
+        n_req = 1
+        can_make_test = False
+    else:
+        n_req = st.slider(
+            "Number of questions",
+            min_value=1,
+            max_value=max_q,
+            value=min(10, max_q),
+        )
+        can_make_test = True
 
     st.checkbox("Show answer key (facit)", key="show_facit")
     st.checkbox("Practice mode (instant feedback)", key="practice_mode")
     st.checkbox("Lock test after grading", key="lock_after_submit")
 
     st.divider()
-    if st.button("🎲 Create new random test", use_container_width=True):
+    if st.button("🎲 Create new random test", use_container_width=True, disabled=not can_make_test):
         create_new_random_exam(n_req)
         do_rerun()
 
 
-tabs = st.tabs(["🧱 Build Question Bank", "📝 Take Test", "📊 Results history"])
+tabs = st.tabs(["🧱 Builder", "📝 Take test", "📊 History"])
 
 
 # ============================================================
-# TAB 1: BUILD BANK
+# TAB 1: BUILDER (Wizard)
 # ============================================================
 
 with tabs[0]:
-    bank = load_bank_objects()
+    st.subheader("Add a new question (wizard)")
 
-    st.subheader("Add a new question")
-
-    with st.form("add_question_form", clear_on_submit=True):
+    with st.form("add_question_wizard", clear_on_submit=True):
         qtype = st.selectbox("Question type", ["single", "multi", "ordering"])
         qtext = st.text_area("Question text", height=90)
 
         category = st.text_input("Category", value="General")
         tags_raw = st.text_input("Tags (comma-separated)", value="")
 
-        options_raw = st.text_area("Options (one per line)", height=140)
-        max_points = st.number_input("Max points", min_value=1, max_value=20, value=1, step=1)
+        max_points = st.number_input("Total points for this question", min_value=1, max_value=50, value=1, step=1)
+
+        options: List[str] = []
+        correct_single = None
+        correct_multi: List[int] = []
+        correct_order: List[str] = []
+        allow_partial_scoring = False
+        points_per_correct = 0
+
+        if qtype in ("single", "multi"):
+            n_opts = st.number_input("Number of answer choices", min_value=2, max_value=12, value=4, step=1)
+
+            if qtype == "single":
+                n_correct = 1
+            else:
+                n_correct = st.number_input(
+                    "Number of correct answers",
+                    min_value=1,
+                    max_value=int(n_opts),
+                    value=1,
+                    step=1
+                )
+                allow_partial_scoring = st.checkbox("Use points per correct answer (partial scoring)", value=False)
+                if allow_partial_scoring:
+                    points_per_correct = int(st.number_input("Points per correct answer", min_value=1, max_value=50, value=1, step=1))
+                else:
+                    points_per_correct = 0
+
+            st.markdown("### Answers")
+            for i in range(int(n_opts)):
+                options.append(st.text_input(f"Answer {i+1}", value=""))
+
+            if qtype == "single":
+                st.markdown("### Correct answer")
+                correct_single = st.radio(
+                    "Select the correct answer",
+                    options=list(range(int(n_opts))),
+                    format_func=lambda idx: options[idx] if options[idx].strip() else f"(Answer {idx+1} is empty)",
+                    index=None,
+                )
+            else:
+                st.markdown("### Correct answers")
+                correct_multi = st.multiselect(
+                    f"Select exactly {int(n_correct)} correct answers",
+                    options=list(range(int(n_opts))),
+                    format_func=lambda idx: options[idx] if options[idx].strip() else f"(Answer {idx+1} is empty)",
+                    default=[],
+                )
+
+        else:
+            n_items = st.number_input("Number of items to order", min_value=2, max_value=12, value=4, step=1)
+
+            st.markdown("### Items")
+            for i in range(int(n_items)):
+                options.append(st.text_input(f"Item {i+1}", value=""))
+
+            st.markdown("### Correct order")
+            correct_order = st.multiselect(
+                "Select items in the correct order (must include all items exactly once)",
+                options=options,
+                default=[],
+            )
 
         submitted = st.form_submit_button("➕ Add question")
-        if submitted:
-            opts = [line.strip() for line in options_raw.splitlines() if line.strip()]
-            tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
 
+        if submitted:
             if not qtext.strip():
                 st.error("Question text is required.")
-            elif qtype in ("single", "multi") and len(opts) < 2:
-                st.error("Single/Multi questions need at least 2 options.")
-            elif qtype == "ordering" and len(opts) < 2:
-                st.error("Ordering questions need at least 2 items.")
-            else:
-                qid = next_id(bank)
-                newq = BankQuestion(
-                    id=qid,
-                    text=qtext.strip(),
-                    qtype=qtype,
-                    options=opts,
-                    category=category.strip() or "General",
-                    tags=tags,
-                    max_points=int(max_points),
-                )
-                bank.append(newq)
-                save_bank_objects(bank)
-                st.success(f"Added {qid}. Now set the correct answers below.")
-                do_rerun()
+                st.stop()
+
+            if any(not o.strip() for o in options):
+                st.error("All answers/items must have text (no empty fields).")
+                st.stop()
+
+            tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+
+            if qtype == "single":
+                if correct_single is None:
+                    st.error("Pick the correct answer.")
+                    st.stop()
+
+            if qtype == "multi":
+                # ensure exact correct count if user specified
+                # n_correct exists only in multi branch
+                if len(correct_multi) != int(n_correct):
+                    st.error(f"You must select exactly {int(n_correct)} correct answers.")
+                    st.stop()
+
+            if qtype == "ordering":
+                if len(correct_order) != len(options) or len(set(correct_order)) != len(correct_order):
+                    st.error("Correct order must include every item exactly once.")
+                    st.stop()
+
+            bank = load_bank_objects()
+            qid = next_id(bank)
+
+            newq = BankQuestion(
+                id=qid,
+                text=qtext.strip(),
+                qtype=qtype,
+                options=options,
+                category=category.strip() or "General",
+                tags=tags,
+                max_points=int(max_points),
+                correct_single=int(correct_single) if qtype == "single" else None,
+                correct_multi=[int(x) for x in correct_multi] if qtype == "multi" else None,
+                correct_order=list(correct_order) if qtype == "ordering" else None,
+                allow_partial_scoring=bool(allow_partial_scoring) if qtype == "multi" else False,
+                points_per_correct=int(points_per_correct) if qtype == "multi" else 0,
+            )
+
+            bank.append(newq)
+            save_bank_objects(bank)
+            st.success(f"Added {qid}!")
+            do_rerun()
 
     st.divider()
-    st.subheader(f"Question bank ({len(bank)} questions)")
+    st.subheader("Edit / delete existing questions")
 
+    bank = load_bank_objects()
     if not bank:
-        st.info("No questions yet. Add some above.")
+        st.info("No questions yet. Add one above.")
     else:
-        q_search = st.text_input("Search (text/category/tag)", value="")
+        search = st.text_input("Search (text/category/tag/id)", value="")
         filtered = bank
-        if q_search.strip():
-            s = q_search.strip().lower()
+        if search.strip():
+            s = search.strip().lower()
 
             def match(q: BankQuestion) -> bool:
                 if s in q.id.lower():
@@ -660,118 +793,113 @@ with tabs[0]:
             filtered = [q for q in bank if match(q)]
 
         st.caption(f"Showing {len(filtered)} / {len(bank)}")
+
         for q in filtered:
             title = f"{q.id} — {q.qtype} — [{q.category}] — {q.text[:70]}{'...' if len(q.text) > 70 else ''}"
             with st.expander(title, expanded=False):
-                st.write(q.text)
+                new_text = st.text_area("Question text", value=q.text, key=f"edit_text_{q.id}", height=80)
+                new_category = st.text_input("Category", value=q.category or "General", key=f"edit_cat_{q.id}")
+                new_tags_raw = st.text_input("Tags (comma-separated)", value=", ".join(q.tags or []), key=f"edit_tags_{q.id}")
 
-                new_text = st.text_area("Edit question text", value=q.text, key=f"edit_text_{q.id}", height=80)
-                new_category = st.text_input("Category", value=q.category or "General", key=f"cat_{q.id}")
-                tags_str = ", ".join(q.tags or [])
-                new_tags_raw = st.text_input("Tags (comma-separated)", value=tags_str, key=f"tags_{q.id}")
+                new_opts_raw = st.text_area("Options (one per line)", value="\n".join(q.options), key=f"edit_opts_{q.id}", height=140)
+                new_opts = [line.strip() for line in new_opts_raw.splitlines() if line.strip()]
 
-                opt_text = "\n".join(q.options)
-                new_opt_raw = st.text_area("Edit options (one per line)", value=opt_text, key=f"edit_opts_{q.id}", height=140)
-                new_opts = [line.strip() for line in new_opt_raw.splitlines() if line.strip()]
+                new_max_points = st.number_input("Total points", min_value=1, max_value=50, value=int(q.max_points), step=1, key=f"edit_pts_{q.id}")
 
-                # Correct answer editors
-                corr_single = None
-                corr_multi = None
-                corr_order = None
+                allow_partial = False
+                ppc = 0
 
                 if q.qtype == "single":
-                    if len(new_opts) >= 2:
-                        corr_single = st.radio(
-                            "Correct option",
-                            options=list(range(len(new_opts))),
-                            format_func=lambda idx: new_opts[idx],
-                            index=q.correct_single if q.correct_single is not None and q.correct_single < len(new_opts) else None,
-                            key=f"corr_single_{q.id}",
-                        )
-                    else:
-                        st.warning("Need at least 2 options.")
+                    corr_single = st.radio(
+                        "Correct option",
+                        options=list(range(len(new_opts))) if len(new_opts) >= 2 else [],
+                        format_func=lambda idx: new_opts[idx],
+                        index=q.correct_single if q.correct_single is not None and q.correct_single < len(new_opts) else None,
+                        key=f"edit_corr_single_{q.id}",
+                    )
+                    corr_multi = None
+                    corr_order = None
 
                 elif q.qtype == "multi":
-                    if len(new_opts) >= 2:
-                        corr_multi = st.multiselect(
-                            "Correct options",
-                            options=list(range(len(new_opts))),
-                            format_func=lambda idx: new_opts[idx],
-                            default=[c for c in (q.correct_multi or []) if c < len(new_opts)],
-                            key=f"corr_multi_{q.id}",
-                        )
+                    corr_multi = st.multiselect(
+                        "Correct options",
+                        options=list(range(len(new_opts))) if len(new_opts) >= 2 else [],
+                        format_func=lambda idx: new_opts[idx],
+                        default=[c for c in (q.correct_multi or []) if c < len(new_opts)],
+                        key=f"edit_corr_multi_{q.id}",
+                    )
+                    allow_partial = st.checkbox("Use points per correct answer", value=bool(q.allow_partial_scoring), key=f"edit_allow_partial_{q.id}")
+                    if allow_partial:
+                        ppc = int(st.number_input("Points per correct", min_value=1, max_value=50, value=max(1, int(q.points_per_correct or 1)), step=1, key=f"edit_ppc_{q.id}"))
                     else:
-                        st.warning("Need at least 2 options.")
+                        ppc = 0
 
-                else:  # ordering
+                    corr_single = None
+                    corr_order = None
+
+                else:
                     corr_order = st.multiselect(
-                        "Correct order (select items in correct order)",
+                        "Correct order (select items in order)",
                         options=new_opts,
                         default=q.correct_order or [],
-                        key=f"corr_order_{q.id}",
-                        help="Must include every item exactly once, in correct order.",
+                        key=f"edit_corr_order_{q.id}",
                     )
-
-                new_points = st.number_input("Max points", min_value=1, max_value=20, value=int(q.max_points), step=1, key=f"pts_{q.id}")
+                    corr_single = None
+                    corr_multi = None
 
                 c1, c2 = st.columns(2)
                 with c1:
                     if st.button("💾 Save changes", key=f"save_{q.id}"):
+                        if not new_text.strip():
+                            st.error("Question text cannot be empty.")
+                            st.stop()
+                        if len(new_opts) < 2:
+                            st.error("Need at least 2 options/items.")
+                            st.stop()
+
                         q.text = new_text.strip()
-                        q.options = new_opts
                         q.category = (new_category.strip() or "General")
                         q.tags = [t.strip() for t in new_tags_raw.split(",") if t.strip()]
-                        q.max_points = int(new_points)
+                        q.options = new_opts
+                        q.max_points = int(new_max_points)
 
                         if q.qtype == "single":
-                            q.correct_single = corr_single if isinstance(corr_single, int) else None
+                            if corr_single is None:
+                                st.error("Pick the correct option.")
+                                st.stop()
+                            q.correct_single = int(corr_single)
                             q.correct_multi = None
                             q.correct_order = None
+                            q.allow_partial_scoring = False
+                            q.points_per_correct = 0
+
                         elif q.qtype == "multi":
-                            q.correct_multi = list(corr_multi or [])
+                            q.correct_multi = [int(x) for x in (corr_multi or [])]
                             q.correct_single = None
                             q.correct_order = None
+                            q.allow_partial_scoring = bool(allow_partial)
+                            q.points_per_correct = int(ppc)
+
                         else:
                             if len(corr_order or []) != len(new_opts) or len(set(corr_order or [])) != len(corr_order or []):
-                                st.error("Ordering correct answer must include every item exactly once.")
+                                st.error("Correct order must include every item exactly once.")
                                 st.stop()
                             q.correct_order = list(corr_order or [])
                             q.correct_single = None
                             q.correct_multi = None
+                            q.allow_partial_scoring = False
+                            q.points_per_correct = 0
 
                         save_bank_objects(bank)
-                        st.success("Saved (Google Drive).")
+                        st.success("Saved.")
                         do_rerun()
 
                 with c2:
-                    if st.button("🗑 Delete question", key=f"del_{q.id}"):
-                        bank = [qq for qq in bank if qq.id != q.id]
-                        save_bank_objects(bank)
-                        st.success("Deleted (Google Drive).")
+                    if st.button("🗑 Delete", key=f"del_{q.id}"):
+                        bank2 = [qq for qq in bank if qq.id != q.id]
+                        save_bank_objects(bank2)
+                        st.success("Deleted.")
                         do_rerun()
-
-    st.divider()
-    st.subheader("Import / Export bank (JSON)")
-
-    colA, colB = st.columns(2)
-    with colA:
-        export = json.dumps(st.session_state.question_bank, indent=2, ensure_ascii=False)
-        st.download_button("⬇️ Download bank.json", data=export.encode("utf-8"), file_name=f"{user}_bank.json", mime="application/json")
-
-    with colB:
-        up = st.file_uploader("Upload bank.json", type=["json"])
-        if up is not None:
-            try:
-                data = json.loads(up.read().decode("utf-8"))
-                if not isinstance(data, list):
-                    raise ValueError("JSON must be a list of questions.")
-                _ = [BankQuestion(**item) for item in data]  # validate
-                st.session_state.question_bank = data
-                save_bank_for_user(user)
-                st.success(f"Imported {len(data)} questions (Google Drive).")
-                do_rerun()
-            except Exception as e:
-                st.error(f"Import failed: {e}")
 
 
 # ============================================================
@@ -782,9 +910,9 @@ with tabs[1]:
     bank = load_bank_objects()
 
     if not bank:
-        st.info("Add questions in **Build Question Bank** first.")
+        st.info("Add questions in the Builder tab first.")
     elif not st.session_state.exam:
-        st.info("Click **Create new random test** in the sidebar to start.")
+        st.info("Create a random test from the sidebar to start.")
     else:
         exam: List[BankQuestion] = st.session_state.exam
         exam_meta: Dict[int, Dict[str, Any]] = st.session_state.exam_meta
@@ -806,7 +934,7 @@ with tabs[1]:
                     "",
                     options=list(range(len(display_options))),
                     format_func=lambda i: display_options[i],
-                    index=None,
+                    index=None,  # empty until clicked
                     key=f"single_{idx}",
                     disabled=disabled,
                 )
@@ -834,7 +962,7 @@ with tabs[1]:
                         sel = st.selectbox(
                             f"{pos+1}",
                             options=dropdown,
-                            index=None,
+                            index=None,  # empty until chosen
                             placeholder="Select...",
                             key=f"order_{idx}_{pos}",
                             disabled=disabled,
@@ -842,6 +970,7 @@ with tabs[1]:
                     chosen.append(sel)
                 st.session_state.answers[idx] = chosen
 
+            # practice feedback
             if st.session_state.practice_mode:
                 ans_disp = st.session_state.answers.get(idx)
                 if q.qtype in ("single", "multi"):
@@ -889,6 +1018,7 @@ with tabs[1]:
 
             failed_count = sum(1 for r in results if not r["correct"])
             st.markdown("---")
+
             if failed_count > 0:
                 st.info(f"You have {failed_count} failed question(s).")
                 c1, c2 = st.columns([1, 2])
@@ -911,19 +1041,19 @@ with tabs[1]:
                         retry_failed_plus_random(results, extra_random=int(extra))
                         do_rerun()
             else:
-                st.success("🎉 All questions correct — nothing to retry!")
+                st.success("🎉 All correct — nothing to retry!")
 
 
 # ============================================================
-# TAB 3: RESULTS HISTORY
+# TAB 3: HISTORY
 # ============================================================
 
 with tabs[2]:
-    st.subheader("Results history (Google Drive)")
+    st.subheader("Results history")
 
     results = load_results_for_user(user)
     if not results:
-        st.info("No saved attempts yet. Take a test and grade it to save results.")
+        st.info("No saved attempts yet. Grade a test to save results.")
     else:
         results_sorted = list(reversed(results))
         st.write(f"Saved attempts: **{len(results_sorted)}**")
